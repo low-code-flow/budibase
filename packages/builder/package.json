@@ -92,6 +92,7 @@
     "@sveltejs/vite-plugin-svelte": "1.4.0",
     "@testing-library/jest-dom": "6.4.2",
     "@testing-library/svelte": "^4.1.0",
+    "@types/downloadjs": "1.4.6",
     "@types/sanitize-html": "^2.13.0",
     "@types/shortid": "^2.2.0",
     "babel-jest": "^29.6.2",

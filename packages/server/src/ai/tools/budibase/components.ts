@@ -14,8 +14,7 @@ import { utils } from "@budibase/shared-core"
 export default [
   newTool({
     name: "render_table_form",
-    description: `Render an interactive form component for a Budibase table so the user can create or edit records directly in the UI. Call this tool when the user needs a form-driven workflow instead of plain-text instructions.
-When you include the tool result in your reply, write natural-language guidance, then place {{toolResult:component:<toolCallId>}} exactly where the form should appear (no code fences, no field lists). The client will replace that token with the actual component.`,
+    description: `Render an interactive form component for a Budibase table so the user can create or edit records directly in the UI. Call this tool when the user needs a form-driven workflow instead of plain-text instructions`,
     parameters: z.object({
       tableId: z
         .string()
@@ -136,8 +135,7 @@ When you include the tool result in your reply, write natural-language guidance,
           `When replying to the user:\n` +
           `1. Acknowledge the form you are providing in natural language.\n` +
           `2. Do not describe or list individual fields, inputs, or defaults—the UI component already shows them.\n` +
-          `3. Insert the placeholder {{toolResult:component:${toolCallId}}} exactly where the form should render. Do not wrap it in backticks or code fences.\n` +
-          `4. Continue your response if additional guidance is needed.\n`,
+          `3. Continue your response if additional guidance is needed.\n`,
         type: "component",
         component,
       })
@@ -216,6 +214,7 @@ When you include the tool result in your reply, write natural-language guidance,
         componentId,
         message: `Form submission processed successfully for component ${componentId}.`,
         row,
+        removeComponentMessage: true,
       })
     },
   }),

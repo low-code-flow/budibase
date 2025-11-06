@@ -19,9 +19,23 @@ import {
   UpdateAgentResponse,
   UpdateToolSourceRequest,
   UserCtx,
+  type AgentStreamEvent,
+  type AgentOutputItem,
+  type AgentOutputItemPatch,
+  type AgentResponseStartedEvent,
+  type AgentOutputTextDeltaEvent,
+  type AgentOutputTextCompletedEvent,
+  type AgentOutputItemCreatedEvent,
+  type AgentOutputItemUpdatedEvent,
+  type AgentToolCallStartedEvent,
+  type AgentToolCallCompletedEvent,
+  type AgentRunCompletedEvent,
+  type AgentRunErrorEvent,
+  type AgentRunSavedEvent,
 } from "@budibase/types"
 import { createToolSource as createToolSourceInstance } from "../../../ai/tools/base"
 import sdk from "../../../sdk"
+import { randomUUID } from "crypto"
 
 function addDebugInformation(messages: Message[]) {
   const processedMessages = [...messages]
@@ -86,6 +100,83 @@ export async function agentChatStream(ctx: UserCtx<ChatAgentRequest, void>) {
 
   const agent = await sdk.ai.agents.getOrThrow(agentId)
 
+  const runId = randomUUID()
+  const responseId = randomUUID()
+  let sequence = 0
+  let activeTextItemId: string | undefined
+  let accumulatedText = ""
+
+  const emitEventInternal = (
+    event: Omit<AgentStreamEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => {
+    const enriched = {
+      ...event,
+      eventId: randomUUID(),
+      runId,
+      sequence: sequence++,
+      timestamp: new Date().toISOString(),
+    } as AgentStreamEvent
+    ctx.res.write(`data: ${JSON.stringify({ event: enriched })}\n\n`)
+  }
+
+  const emitResponseStarted = (
+    event: Omit<AgentResponseStartedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitOutputTextDelta = (
+    event: Omit<AgentOutputTextDeltaEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitOutputTextCompleted = (
+    event: Omit<AgentOutputTextCompletedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitOutputItemCreated = (
+    event: Omit<AgentOutputItemCreatedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitOutputItemUpdated = (
+    event: Omit<AgentOutputItemUpdatedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitToolCallStarted = (
+    event: Omit<AgentToolCallStartedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitToolCallCompleted = (
+    event: Omit<AgentToolCallCompletedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitRunCompleted = (
+    event: Omit<AgentRunCompletedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitRunError = (
+    event: Omit<AgentRunErrorEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const emitRunSaved = (
+    event: Omit<AgentRunSavedEvent, "eventId" | "runId" | "sequence" | "timestamp">
+  ) => emitEventInternal(event)
+
+  const ensureTextItem = () => {
+    if (!activeTextItemId) {
+      activeTextItemId = randomUUID()
+      const item: AgentOutputItem = {
+        id: activeTextItemId,
+        type: "text",
+        role: "assistant",
+        text: "",
+      }
+      emitOutputItemCreated({
+        type: "response.output_item.created",
+        responseId,
+        item,
+      })
+    }
+    return activeTextItemId
+  }
+
   let prompt = new ai.LLMRequest()
     .addSystemMessage(ai.agentSystemPrompt(ctx.user))
     .addMessages(chat.messages)
@@ -118,27 +209,187 @@ export async function agentChatStream(ctx: UserCtx<ChatAgentRequest, void>) {
     prompt = prompt.addSystemMessage(toolGuidelines)
   }
 
+  emitResponseStarted({
+    type: "response.started",
+    responseId,
+    metadata: {
+      agentId,
+    },
+  })
+
   try {
     let finalMessages: Message[] = []
     let totalTokens = 0
 
     for await (const chunk of model.chatStream(prompt)) {
-      // Send chunk to client
-      ctx.res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+      if (chunk.type === "content" && chunk.content) {
+        const itemId = ensureTextItem()
+        accumulatedText += chunk.content
+        emitOutputTextDelta({
+          type: "response.output_text.delta",
+          responseId,
+          itemId,
+          delta: chunk.content,
+        })
+      } else if (chunk.type === "tool_call_start" && chunk.toolCall) {
+        let parsedArgs: Record<string, unknown> = {}
+        try {
+          parsedArgs = JSON.parse(chunk.toolCall.arguments || "{}")
+        } catch {
+          parsedArgs = {
+            raw: chunk.toolCall.arguments,
+          }
+        }
+        emitToolCallStarted({
+          type: "response.tool_call.started",
+          responseId,
+          callId: chunk.toolCall.id,
+          name: chunk.toolCall.name,
+          arguments: parsedArgs,
+        })
+      } else if (chunk.type === "tool_call_result" && chunk.toolResult) {
+        let parsedResult: Record<string, unknown> | string | undefined =
+          chunk.toolResult.result
+        if (chunk.toolResult.result) {
+          try {
+            const parsedJson = JSON.parse(chunk.toolResult.result)
+            if (parsedJson && typeof parsedJson === "object") {
+              parsedResult = parsedJson
+            }
+          } catch {
+            // ignore parsing failure and fall back to string result
+          }
+        }
 
-      if (chunk.type === "done") {
-        finalMessages = chunk.messages || []
-        totalTokens = chunk.tokensUsed || 0
-        break
+        emitToolCallCompleted({
+          type: "response.tool_call.completed",
+          responseId,
+          callId: chunk.toolResult.id,
+          status: chunk.toolResult.error ? "error" : "success",
+          result:
+            chunk.toolResult.error || parsedResult === undefined
+              ? undefined
+              : parsedResult,
+          error: chunk.toolResult.error
+            ? {
+                message: chunk.toolResult.error,
+              }
+            : undefined,
+        })
+
+        if (
+          !chunk.toolResult.error &&
+          parsedResult &&
+          typeof parsedResult === "object"
+        ) {
+          const parsedObject = parsedResult as Record<string, unknown>
+          const maybeMessage = parsedObject.message
+          if (typeof maybeMessage === "string" && maybeMessage.length) {
+            const itemId = randomUUID()
+            emitOutputItemCreated({
+              type: "response.output_item.created",
+              responseId,
+              item: {
+                id: itemId,
+                type: "text",
+                role: "assistant",
+                text: maybeMessage,
+                metadata: {
+                  sourceToolCallId: chunk.toolResult.id,
+                },
+              },
+            })
+            emitOutputTextCompleted({
+              type: "response.output_text.completed",
+              responseId,
+              itemId,
+              text: maybeMessage,
+            })
+          }
+
+          const maybeComponent = parsedObject.component
+          if (maybeComponent && typeof maybeComponent === "object") {
+            const componentId =
+              (maybeComponent as { componentId?: string }).componentId ||
+              randomUUID()
+            emitOutputItemCreated({
+              type: "response.output_item.created",
+              responseId,
+              item: {
+                id: componentId,
+                type: "component",
+                role: "assistant",
+                component: maybeComponent as any,
+                metadata: {
+                  sourceToolCallId: chunk.toolResult.id,
+                },
+              },
+            })
+          }
+
+          if (
+            parsedObject.removeComponentMessage &&
+            parsedObject.componentId &&
+            typeof parsedObject.componentId === "string"
+          ) {
+            const patch: AgentOutputItemPatch = {
+              state: "hidden",
+              metadata: {
+                reason: "submitted",
+                sourceToolCallId: chunk.toolResult.id,
+              },
+            }
+            const successMessage =
+              typeof parsedObject.message === "string"
+                ? parsedObject.message
+                : undefined
+            if (successMessage && successMessage.length) {
+              patch.replaceWith = {
+                id: `${parsedObject.componentId}-result-${randomUUID()}`,
+                type: "text",
+                role: "assistant",
+                text: successMessage,
+                metadata: {
+                  sourceToolCallId: chunk.toolResult.id,
+                },
+              }
+            }
+            emitOutputItemUpdated({
+              type: "response.output_item.updated",
+              responseId,
+              itemId: parsedObject.componentId,
+              patch,
+            })
+          }
+        }
       } else if (chunk.type === "error") {
-        ctx.res.write(
-          `data: ${JSON.stringify({
-            type: "error",
-            content: chunk.content,
-          })}\n\n`
-        )
+        emitRunError({
+          type: "response.error",
+          responseId,
+          error: {
+            message: chunk.content || "An error occurred",
+            retryable: false,
+          },
+        })
         ctx.res.end()
         return
+      } else if (chunk.type === "done") {
+        finalMessages = chunk.messages || []
+        totalTokens = chunk.tokensUsed || 0
+        if (activeTextItemId) {
+          emitOutputTextCompleted({
+            type: "response.output_text.completed",
+            responseId,
+            itemId: activeTextItemId,
+            text: accumulatedText,
+          })
+        }
+        emitRunCompleted({
+          type: "response.completed",
+          responseId,
+          tokensUsed: totalTokens,
+        })
+        break
       }
     }
 
@@ -147,6 +398,7 @@ export async function agentChatStream(ctx: UserCtx<ChatAgentRequest, void>) {
       if (!chat._id) {
         chat._id = docIds.generateAgentChatID()
       }
+      const chatId = chat._id as string
 
       if (!chat.title || chat.title === "") {
         const titlePrompt = new ai.LLMRequest()
@@ -157,7 +409,7 @@ export async function agentChatStream(ctx: UserCtx<ChatAgentRequest, void>) {
       }
 
       const newChat: AgentChat = {
-        _id: chat._id,
+        _id: chatId,
         _rev: chat._rev,
         agentId,
         title: chat.title,
@@ -167,20 +419,33 @@ export async function agentChatStream(ctx: UserCtx<ChatAgentRequest, void>) {
       const { rev } = await db.put(newChat)
 
       // Send final chat info
-      ctx.res.write(
-        `data: ${JSON.stringify({
-          type: "chat_saved",
-          chat: { ...newChat, _rev: rev },
+      const savedEvent: Omit<
+        AgentRunSavedEvent,
+        "eventId" | "runId" | "sequence" | "timestamp"
+      > = {
+        type: "response.saved",
+        responseId,
+        chatId,
+        metadata: {
           tokensUsed: totalTokens,
-        })}\n\n`
-      )
+        },
+      }
+      if (rev) {
+        savedEvent.revision = rev
+      }
+      emitRunSaved(savedEvent)
     }
 
     ctx.res.end()
   } catch (error: any) {
-    ctx.res.write(
-      `data: ${JSON.stringify({ type: "error", content: error.message })}\n\n`
-    )
+    emitRunError({
+      type: "response.error",
+      responseId,
+      error: {
+        message: error.message,
+        retryable: false,
+      },
+    })
     ctx.res.end()
   }
 }

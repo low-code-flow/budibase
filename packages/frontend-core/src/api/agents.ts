@@ -8,7 +8,7 @@ import {
   CreateToolSourceRequest,
   FetchAgentHistoryResponse,
   FetchAgentsResponse,
-  LLMStreamChunk,
+  AgentStreamEvent,
   UpdateAgentRequest,
   UpdateAgentResponse,
 } from "@budibase/types"
@@ -20,7 +20,7 @@ export interface AgentEndpoints {
   agentChatStream: (
     chat: AgentChat,
     workspaceId: string,
-    onChunk: (chunk: LLMStreamChunk) => void,
+    onEvent: (event: AgentStreamEvent) => void,
     onError?: (error: Error) => void
   ) => Promise<void>
 
@@ -40,7 +40,7 @@ export interface AgentEndpoints {
 }
 
 export const buildAgentEndpoints = (API: BaseAPIClient): AgentEndpoints => ({
-  agentChatStream: async (chat, workspaceId, onChunk, onError) => {
+  agentChatStream: async (chat, workspaceId, onEvent, onError) => {
     const body: ChatAgentRequest = chat
 
     try {
@@ -89,8 +89,10 @@ export const buildAgentEndpoints = (API: BaseAPIClient): AgentEndpoints => ({
             try {
               const data = line.slice(6) // Remove 'data: ' prefix
               if (data.trim()) {
-                const chunk: LLMStreamChunk = JSON.parse(data)
-                onChunk(chunk)
+                const parsed = JSON.parse(data)
+                if (parsed?.event) {
+                  onEvent(parsed.event as AgentStreamEvent)
+                }
               }
             } catch (parseError) {
               console.error("Failed to parse SSE data:", parseError)

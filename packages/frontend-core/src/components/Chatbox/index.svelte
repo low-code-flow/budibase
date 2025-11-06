@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { MarkdownViewer, notifications } from "@budibase/bbui"
-  import { createAPIClient } from "@budibase/frontend-core"
-  import type {
-    AgentChat,
+import { MarkdownViewer, notifications } from "@budibase/bbui"
+import { createAPIClient } from "@budibase/frontend-core"
+import type {
+  AgentChat,
+  AgentStreamEvent,
     AssistantMessage,
+    ComponentPayload,
     SystemMessage,
     UserMessage,
   } from "@budibase/types"
@@ -24,120 +26,240 @@
   let observer: MutationObserver
   let textareaElement: HTMLTextAreaElement
   let componentLoading = new Set<string>()
-  let toolResponses: Record<string, string> = {}
-
-  const extractToolResponses = (
-    messages: AgentChat["messages"] = []
-  ): Record<string, string> => {
-    return messages.reduce(
-      (acc, message) => {
-        if (message.role === "tool" && message.tool_call_id) {
-          acc[message.tool_call_id] = message.content
-        }
-        return acc
-      },
-      {} as Record<string, string>
-    )
+  type AssistantTextSegment = { id: string; type: "text"; content: string }
+  type AssistantComponentSegment = {
+    id: string
+    type: "component"
+    component: ComponentPayload
+    hidden?: boolean
   }
-
-  $: if (chat?.messages?.length) {
-    const extracted = extractToolResponses(chat.messages)
-    if (Object.keys(extracted).length) {
-      toolResponses = {
-        ...toolResponses,
-        ...extracted,
-      }
-    }
-  }
-
-  type AssistantSegment =
-    | { type: "text"; content: string }
-    | {
-        type: "component"
-        componentId: string
-        component?: any // TODO
-        loading: boolean
-      }
-
+  type AssistantSegment = AssistantTextSegment | AssistantComponentSegment
   const toolResultComponentPlaceholderRegex =
     /\{\{toolResult:component:([^}]+)\}\}/g
 
-  const getToolResponse = (runId: string) => {
-    const resolved = toolResponses[runId.trim()]
-    if (!resolved) {
-      return undefined
-    }
-    try {
-      const parsed = JSON.parse(resolved || "")
-      if (parsed && typeof parsed === "object") {
-        return parsed
-      }
-    } catch {
-      // not JSON, return as is
-    }
-    return resolved
+  interface ResponseState {
+    responseId: string
+    messageIndex: number
+    segments: AssistantSegment[]
   }
 
-  const getAssistantSegments = (
-    message: AssistantMessage
-  ): AssistantSegment[] => {
-    let content = message.content
-    if (!content) {
-      return []
+  const responseStates = new Map<string, ResponseState>()
+  const itemToResponse = new Map<
+    string,
+    { responseId: string; segmentIndex: number }
+  >()
+  const messageResponseMap = new Map<number, string>()
+  const toolCallComponentMap = new Map<string, string>()
+  let responseStatesVersion = 0
+  let activeResponseId: string | null = null
+  let lastHydratedKey: string | null = null
+
+  const setComponentLoading = (componentId: string, isLoading: boolean) => {
+    if (!componentId) {
+      return
     }
-
-    const segments: AssistantSegment[] = []
-    toolResultComponentPlaceholderRegex.lastIndex = 0
-    let lastIndex = 0
-    let match: RegExpExecArray | null
-
-    while ((match = toolResultComponentPlaceholderRegex.exec(content))) {
-      const matchIndex = match.index ?? 0
-      const textBefore = content.slice(lastIndex, matchIndex).trim()
-      if (textBefore) {
-        segments.push({ type: "text", content: textBefore })
-      }
-
-      const toolId = match[1]?.trim()
-      if (toolId) {
-        const componentResponse = getToolResponse(toolId)
-        const componentPayload = componentResponse?.component
-        const hasComponent =
-          componentPayload !== undefined && componentPayload !== null
-        segments.push({
-          type: "component",
-          componentId: toolId,
-          component: hasComponent ? componentPayload : undefined,
-          loading: !hasComponent,
-        })
-      }
-
-      lastIndex = matchIndex + match[0].length
+    const next = new Set(componentLoading)
+    if (isLoading) {
+      next.add(componentId)
+    } else {
+      next.delete(componentId)
     }
-
-    const remaining = content.slice(lastIndex).trim()
-    if (remaining) {
-      segments.push({ type: "text", content: remaining })
-    }
-
-    if (!segments.length) {
-      return [{ type: "text", content }]
-    }
-
-    return segments
+    componentLoading = next
   }
 
   const clearComponentLoading = (componentId?: string) => {
     if (!componentId) {
       return
     }
-    if (componentLoading.has(componentId)) {
-      componentLoading.delete(componentId)
+    setComponentLoading(componentId, false)
+  }
+ 
+  const reindexResponseSegments = (responseId: string) => {
+    const state = responseStates.get(responseId)
+    if (!state) {
+      return
     }
+    state.segments.forEach((segment, index) => {
+      itemToResponse.set(segment.id, {
+        responseId,
+        segmentIndex: index,
+      })
+    })
+  }
+
+  const locateSegment = (itemId: string) => {
+    const existing = itemToResponse.get(itemId)
+    if (existing) {
+      return existing
+    }
+    for (const state of responseStates.values()) {
+      const segmentIndex = state.segments.findIndex(
+        segment => segment.id === itemId
+      )
+      if (segmentIndex !== -1) {
+        const mapping = {
+          responseId: state.responseId,
+          segmentIndex,
+        }
+        itemToResponse.set(itemId, mapping)
+        return mapping
+      }
+    }
+    return undefined
+  }
+
+  const rehydrateFromChatHistory = () => {
+    if (!chat?.messages?.length) {
+      return
+    }
+    const toolResults = new Map<string, any>()
+    for (const message of chat.messages) {
+      if (message.role === "tool" && message.tool_call_id) {
+        const content = (() => {
+          const raw = message.content
+          if (typeof raw === "string") {
+            return raw
+          }
+          if (Array.isArray(raw)) {
+            const items = raw as Array<unknown>
+            return items
+              .map((part: unknown) => {
+                if (typeof part === "string") {
+                  return part
+                }
+                if (
+                  part &&
+                  typeof (part as { text?: unknown }).text === "string"
+                ) {
+                  return (part as { text?: string }).text ?? ""
+                }
+                return ""
+              })
+              .join("")
+          }
+          return ""
+        })()
+        try {
+          const parsed = JSON.parse(content || "{}")
+          toolResults.set(message.tool_call_id, parsed)
+        } catch {
+          // ignore malformed tool messages
+        }
+      }
+    }
+
+    responseStates.clear()
+    itemToResponse.clear()
+    messageResponseMap.clear()
+    componentLoading = new Set<string>()
+
+    chat.messages.forEach((message, index) => {
+      if (message.role !== "assistant") {
+        return
+      }
+      const content =
+        typeof message.content === "string" ? message.content : ""
+      if (!content) {
+        return
+      }
+
+      const segments: AssistantSegment[] = []
+      toolResultComponentPlaceholderRegex.lastIndex = 0
+      let lastIndex = 0
+      let match: RegExpExecArray | null
+
+      while ((match = toolResultComponentPlaceholderRegex.exec(content))) {
+        const matchIndex = match.index ?? 0
+        const textBefore = content.slice(lastIndex, matchIndex).trim()
+        if (textBefore.length) {
+          segments.push({
+            id: `history-${index}-text-${segments.length}`,
+            type: "text",
+            content: textBefore,
+          })
+        }
+        const toolId = match[1]?.trim()
+        const result = toolId ? toolResults.get(toolId) : undefined
+        if (
+          result &&
+          result.component &&
+          !result.removeComponentMessage &&
+          typeof result.component === "object"
+        ) {
+          const componentId =
+            (result.component.componentId as string | undefined) ||
+            toolId ||
+            `history-${index}-component-${segments.length}`
+          segments.push({
+            id: componentId,
+            type: "component",
+            component: result.component as ComponentPayload,
+          })
+        } else if (
+          result &&
+          result.removeComponentMessage &&
+          typeof result.message === "string" &&
+          result.message.length
+        ) {
+          segments.push({
+            id: `history-${index}-text-${segments.length}`,
+            type: "text",
+            content: result.message,
+          })
+        }
+
+        lastIndex = matchIndex + match[0].length
+      }
+
+      const remaining = content.slice(lastIndex).trim()
+      if (remaining.length) {
+        segments.push({
+          id: `history-${index}-text-${segments.length}`,
+          type: "text",
+          content: remaining,
+        })
+      }
+
+      if (!segments.length) {
+        return
+      }
+
+      const responseId = `history-${index}`
+      responseStates.set(responseId, {
+        responseId,
+        messageIndex: index,
+        segments,
+      })
+      messageResponseMap.set(index, responseId)
+      segments.forEach((segment, segmentIndex) => {
+        itemToResponse.set(segment.id, {
+          responseId,
+          segmentIndex,
+        })
+      })
+    })
+
+    responseStatesVersion += 1
   }
 
   $: if (chat.messages.length) {
     scrollToBottom()
+  }
+
+  $: if (responseStatesVersion) {
+    scrollToBottom()
+  }
+
+  $: if (
+    !activeResponseId &&
+    chat?.messages?.length &&
+    chat.messages.length > 0
+  ) {
+    const key = `${chat._rev ?? "no-rev"}:${chat.messages.length}`
+    if (key !== lastHydratedKey) {
+      rehydrateFromChatHistory()
+      lastHydratedKey = key
+    }
   }
 
   async function scrollToBottom() {
@@ -176,83 +298,311 @@
     inputValue = ""
     loading = true
 
-    let streamingContent = ""
+    const pushAssistantMessage = (responseId: string) => {
+      const assistantMessage: AssistantMessage = {
+        role: "assistant",
+        content: "",
+      }
+      const messages = [...updatedChat.messages, assistantMessage]
+      const messageIndex = messages.length - 1
+      messageResponseMap.set(messageIndex, responseId)
+      updatedChat = { ...updatedChat, messages }
+      chat = { ...chat, messages }
+      return messageIndex
+    }
+
+    const refreshAssistantMessageContent = (responseId: string) => {
+      const state = responseStates.get(responseId)
+      if (!state) {
+        return
+    }
+    const existing = updatedChat.messages[state.messageIndex] as
+      | AssistantMessage
+      | undefined
+    if (!existing) {
+      return
+    }
+    const parts: string[] = []
+    for (const segment of state.segments) {
+      if (segment.type === "component") {
+        if (!segment.hidden) {
+          parts.push(`{{toolResult:component:${segment.id}}}`)
+        }
+      } else if (segment.content.trim().length) {
+        parts.push(segment.content.trim())
+      }
+    }
+    const textContent = parts.join("\n\n").trim()
+    const updatedMessage: AssistantMessage = {
+      ...existing,
+      content: textContent,
+    }
+    const messages = [...updatedChat.messages]
+      messages[state.messageIndex] = updatedMessage
+      updatedChat = { ...updatedChat, messages }
+      chat = { ...chat, messages }
+      messageResponseMap.set(state.messageIndex, responseId)
+    }
+
+    const getOrCreateResponseState = (responseId: string) => {
+      let state = responseStates.get(responseId)
+      if (!state) {
+        const messageIndex = pushAssistantMessage(responseId)
+        state = {
+          responseId,
+          messageIndex,
+          segments: [],
+        }
+        responseStates.set(responseId, state)
+        responseStatesVersion += 1
+      } else {
+        messageResponseMap.set(state.messageIndex, responseId)
+      }
+      return state
+    }
+
+  const replaceSegment = (
+    responseId: string,
+    segmentIndex: number,
+    segment: AssistantSegment
+  ) => {
+      const state = responseStates.get(responseId)
+    if (!state) {
+      return
+    }
+    const segments = [...state.segments]
+    segments[segmentIndex] = segment
+    responseStates.set(responseId, {
+      ...state,
+      segments,
+    })
+    reindexResponseSegments(responseId)
+    responseStatesVersion += 1
+    refreshAssistantMessageContent(responseId)
+  }
+
+  const appendSegment = (responseId: string, segment: AssistantSegment) => {
+    const state = getOrCreateResponseState(responseId)
+    const segments = [...state.segments, segment]
+    responseStates.set(responseId, {
+      ...state,
+      segments,
+    })
+    reindexResponseSegments(responseId)
+    responseStatesVersion += 1
+    refreshAssistantMessageContent(responseId)
+  }
+
+    const updateTextSegment = (
+      itemId: string,
+      updater: (segment: AssistantTextSegment) => AssistantTextSegment
+    ) => {
+      const mapping = itemToResponse.get(itemId)
+      if (!mapping) {
+        return
+      }
+      const state = responseStates.get(mapping.responseId)
+      if (!state) {
+        return
+      }
+      const current = state.segments[mapping.segmentIndex]
+      if (!current || current.type !== "text") {
+        return
+      }
+      const updatedSegment = updater(current)
+      replaceSegment(mapping.responseId, mapping.segmentIndex, updatedSegment)
+    }
 
     try {
       await API.agentChatStream(
         updatedChat,
         workspaceId,
-        chunk => {
-          if (chunk.type === "content") {
-            streamingContent += chunk.content || ""
-
-            const updatedMessages = [...updatedChat.messages]
-
-            const lastMessage = updatedMessages[updatedMessages.length - 1]
-            if (lastMessage?.role === "assistant") {
-              lastMessage.content = streamingContent
-              for (const segment of getAssistantSegments(lastMessage)) {
-                if (segment.type === "component") {
-                  clearComponentLoading(segment.componentId)
+        (event: AgentStreamEvent) => {
+          switch (event.type) {
+            case "response.started": {
+              activeResponseId = event.responseId
+              getOrCreateResponseState(event.responseId)
+              scrollToBottom()
+              break
+            }
+            case "response.output_item.created": {
+              const responseId = event.responseId || activeResponseId
+              if (!responseId) {
+                break
+              }
+              if (event.item.type === "text") {
+                appendSegment(responseId, {
+                  id: event.item.id,
+                  type: "text",
+                  content: event.item.text || "",
+                })
+              } else if (event.item.type === "component") {
+                appendSegment(responseId, {
+                  id: event.item.id,
+                  type: "component",
+                  component: event.item.component,
+                })
+              }
+              break
+            }
+            case "response.output_text.delta": {
+              const responseId = event.responseId || activeResponseId
+              if (!responseId) {
+                break
+              }
+              updateTextSegment(event.itemId, segment => ({
+                ...segment,
+                content: `${segment.content}${event.delta || ""}`,
+              }))
+              break
+            }
+            case "response.output_text.completed": {
+              updateTextSegment(event.itemId, segment => ({
+                ...segment,
+                content: event.text ?? segment.content,
+              }))
+              break
+            }
+            case "response.output_item.updated": {
+              const mapping = locateSegment(event.itemId)
+              if (!mapping) {
+                break
+              }
+              const state = responseStates.get(mapping.responseId)
+              if (!state) {
+                break
+              }
+              const current = state.segments[mapping.segmentIndex]
+              if (!current) {
+                break
+              }
+              if (
+                event.patch.state === "hidden" &&
+                !event.patch.replaceWith
+              ) {
+                const segments = [...state.segments]
+                segments.splice(mapping.segmentIndex, 1)
+                responseStates.set(mapping.responseId, {
+                  ...state,
+                  segments,
+                })
+                itemToResponse.delete(event.itemId)
+                reindexResponseSegments(mapping.responseId)
+                responseStatesVersion += 1
+                refreshAssistantMessageContent(mapping.responseId)
+                if (current.type === "component") {
+                  clearComponentLoading(current.id)
                 }
-              }
-            } else {
-              const newAssistant: AssistantMessage = {
-                role: "assistant",
-                content: streamingContent,
-              }
-              updatedMessages.push(newAssistant)
-              for (const segment of getAssistantSegments(newAssistant)) {
-                if (segment.type === "component") {
-                  clearComponentLoading(segment.componentId)
+              } else if (event.patch.replaceWith) {
+                const replacement: AssistantSegment =
+                  event.patch.replaceWith.type === "text"
+                    ? ({
+                        id: event.patch.replaceWith.id,
+                        type: "text",
+                        content: event.patch.replaceWith.text || "",
+                      } as AssistantTextSegment)
+                    : ({
+                        id: event.patch.replaceWith.id,
+                        type: "component",
+                        component: event.patch.replaceWith
+                          .component as ComponentPayload,
+                      } as AssistantComponentSegment)
+                replaceSegment(
+                  mapping.responseId,
+                  mapping.segmentIndex,
+                  replacement
+                )
+                itemToResponse.delete(event.itemId)
+                clearComponentLoading(event.itemId)
+              } else if (current.type === "component") {
+                const updatedSegment: AssistantComponentSegment = {
+                  ...current,
+                  hidden:
+                    event.patch.state === "hidden" ? true : current.hidden,
                 }
+                if (event.patch.state === "hidden") {
+                  clearComponentLoading(current.id)
+                }
+                replaceSegment(
+                  mapping.responseId,
+                  mapping.segmentIndex,
+                  updatedSegment
+                )
               }
+              break
             }
-
-            chat = {
-              ...chat,
-              messages: updatedMessages,
-            }
-
-            updatedChat = {
-              ...updatedChat,
-              messages: updatedMessages,
-            }
-
-            scrollToBottom()
-          } else if (chunk.type === "tool_call_result") {
-            if (chunk.toolResult?.result) {
-              toolResponses = {
-                ...toolResponses,
-                [chunk.toolResult.id]: chunk.toolResult.result,
+            case "response.tool_call.started": {
+              const componentId = (() => {
+                const args = event.arguments || {}
+                if (typeof args.componentId === "string") {
+                  return args.componentId
+                }
+                if (typeof args.componentID === "string") {
+                  return args.componentID
+                }
+                return undefined
+              })()
+              if (componentId) {
+                setComponentLoading(componentId, true)
+                toolCallComponentMap.set(event.callId, componentId)
               }
+              break
             }
-          } else if (chunk.type === "chat_saved") {
-            if (chunk.chat) {
-              chat = chunk.chat
-              updatedChat = chunk.chat
-              if (chunk.chat._id) {
-                dispatch("chatSaved", { chatId: chunk.chat._id })
+            case "response.tool_call.completed": {
+              const componentId = toolCallComponentMap.get(event.callId)
+              if (componentId) {
+                clearComponentLoading(componentId)
+                toolCallComponentMap.delete(event.callId)
               }
+              if (event.status === "error" && event.error?.message) {
+                notifications.error(event.error.message)
+              }
+              break
             }
-          } else if (chunk.type === "done") {
-            loading = false
-            scrollToBottom()
-          } else if (chunk.type === "error") {
-            notifications.error(chunk.content || "An error occurred")
-            loading = false
+            case "response.completed": {
+              activeResponseId = null
+              loading = false
+              scrollToBottom()
+              break
+            }
+            case "response.error": {
+              activeResponseId = null
+              loading = false
+              if (event.error?.message) {
+                notifications.error(event.error.message)
+              }
+              break
+            }
+            case "response.saved": {
+              chat = {
+                ...chat,
+                _id: event.chatId,
+                _rev: event.revision ?? chat._rev,
+              }
+              updatedChat = {
+                ...updatedChat,
+                _id: event.chatId,
+                _rev: event.revision ?? updatedChat._rev,
+              }
+              dispatch("chatSaved", { chatId: event.chatId })
+              break
+            }
+            default:
+              break
           }
         },
         error => {
           console.error("Streaming error:", error)
           notifications.error(error.message)
           loading = false
+          activeResponseId = null
         }
       )
     } catch (err: any) {
       console.error(err)
       notifications.error(err.message)
       loading = false
+      activeResponseId = null
     }
 
     // Return focus to textarea after the response
@@ -260,6 +610,39 @@
     if (textareaElement) {
       textareaElement.focus()
     }
+  }
+
+  const getAssistantSegments = (
+    message: AssistantMessage,
+    index: number
+  ): AssistantSegment[] => {
+    responseStatesVersion
+    const responseId = messageResponseMap.get(index)
+    if (responseId) {
+      const state = responseStates.get(responseId)
+      if (state) {
+        return state.segments.filter(segment => {
+          if (segment.type === "component") {
+            return !segment.hidden
+          }
+          return segment.content.trim().length > 0
+        })
+      }
+    }
+
+    const content =
+      typeof message.content === "string" ? message.content.trim() : ""
+    if (content.length) {
+      return [
+        {
+          id: `${index}-text`,
+          type: "text",
+          content,
+        },
+      ]
+    }
+
+    return []
   }
 
   async function submitComponent(
@@ -270,7 +653,7 @@
     }>
   ) {
     const { componentId, tableId, values } = event.detail
-    componentLoading.add(componentId)
+    setComponentLoading(componentId, true)
     const data = {
       type: "FORM_SUBMISSION",
       componentId,
@@ -281,6 +664,14 @@
   }
 
   onMount(async () => {
+    responseStates.clear()
+    itemToResponse.clear()
+    messageResponseMap.clear()
+    toolCallComponentMap.clear()
+    componentLoading = new Set<string>()
+    responseStatesVersion = 0
+    activeResponseId = null
+     lastHydratedKey = null
     chat = { title: "", messages: [], agentId: chat.agentId }
 
     // Ensure we always autoscroll to reveal new messages
@@ -331,32 +722,25 @@
         </div>
       {:else if message.role === "assistant"}
         <div class="message assistant">
-          {#each getAssistantSegments(message) as segment, segmentIndex (`${index}-${segmentIndex}`)}
+          {#each getAssistantSegments(message, index) as segment, segmentIndex (`${index}-${segmentIndex}`)}
             {#if segment.type === "text"}
               <MarkdownViewer value={segment.content} />
             {:else}
               <div
                 class="component-message"
-                class:component-message--loading={segment.loading ||
-                  componentLoading.has(segment.componentId)}
+                class:component-message--loading={componentLoading.has(
+                  segment.id
+                )}
               >
-                {#if segment.component}
-                  <Component
-                    data={segment.component}
-                    on:submit={submitComponent}
-                  />
-                {:else}
-                  <div class="component-message__placeholder">
-                    Preparing component…
-                  </div>
-                {/if}
-                {#if segment.loading || componentLoading.has(segment.componentId)}
+                <Component
+                  data={segment.component}
+                  on:submit={submitComponent}
+                />
+                {#if componentLoading.has(segment.id)}
                   <div class="component-message__overlay">
                     <div class="component-message__status">
                       <span class="component-message__status-dot" />
-                      <span
-                        >{segment.loading ? "Preparing…" : "Submitting…"}</span
-                      >
+                      <span>Submitting…</span>
                     </div>
                   </div>
                 {/if}
@@ -431,7 +815,6 @@
   }
 
   .input-wrapper {
-    position: sticky;
     bottom: 0;
     width: 600px;
     margin: 0 auto;
@@ -483,17 +866,6 @@
   .component-message--loading {
     pointer-events: none;
     opacity: 0.6;
-  }
-  .component-message__placeholder {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 120px;
-    border-radius: 12px;
-    border: 1px dashed var(--grey-4);
-    background: var(--grey-2);
-    color: var(--grey-7);
-    font-size: 14px;
   }
   .component-message__overlay {
     position: absolute;

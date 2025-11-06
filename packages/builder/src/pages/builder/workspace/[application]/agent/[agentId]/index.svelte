@@ -332,6 +332,7 @@
     </Panel>
 
     <div class="chat-wrapper">
+      {chat._id || ""}
       <Chatbox
         bind:chat
         {loading}

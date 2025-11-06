@@ -1,9 +1,9 @@
 <script lang="ts">
-import { MarkdownViewer, notifications } from "@budibase/bbui"
-import { createAPIClient } from "@budibase/frontend-core"
-import type {
-  AgentChat,
-  AgentStreamEvent,
+  import { MarkdownViewer, notifications } from "@budibase/bbui"
+  import { createAPIClient } from "@budibase/frontend-core"
+  import type {
+    AgentChat,
+    AgentStreamEvent,
     AssistantMessage,
     ComponentPayload,
     SystemMessage,
@@ -34,8 +34,6 @@ import type {
     hidden?: boolean
   }
   type AssistantSegment = AssistantTextSegment | AssistantComponentSegment
-  const toolResultComponentPlaceholderRegex =
-    /\{\{toolResult:component:([^}]+)\}\}/g
 
   interface ResponseState {
     responseId: string
@@ -52,7 +50,6 @@ import type {
   const toolCallComponentMap = new Map<string, string>()
   let responseStatesVersion = 0
   let activeResponseId: string | null = null
-  let lastHydratedKey: string | null = null
 
   const setComponentLoading = (componentId: string, isLoading: boolean) => {
     if (!componentId) {
@@ -72,19 +69,6 @@ import type {
       return
     }
     setComponentLoading(componentId, false)
-  }
- 
-  const reindexResponseSegments = (responseId: string) => {
-    const state = responseStates.get(responseId)
-    if (!state) {
-      return
-    }
-    state.segments.forEach((segment, index) => {
-      itemToResponse.set(segment.id, {
-        responseId,
-        segmentIndex: index,
-      })
-    })
   }
 
   const locateSegment = (itemId: string) => {
@@ -108,158 +92,12 @@ import type {
     return undefined
   }
 
-  const rehydrateFromChatHistory = () => {
-    if (!chat?.messages?.length) {
-      return
-    }
-    const toolResults = new Map<string, any>()
-    for (const message of chat.messages) {
-      if (message.role === "tool" && message.tool_call_id) {
-        const content = (() => {
-          const raw = message.content
-          if (typeof raw === "string") {
-            return raw
-          }
-          if (Array.isArray(raw)) {
-            const items = raw as Array<unknown>
-            return items
-              .map((part: unknown) => {
-                if (typeof part === "string") {
-                  return part
-                }
-                if (
-                  part &&
-                  typeof (part as { text?: unknown }).text === "string"
-                ) {
-                  return (part as { text?: string }).text ?? ""
-                }
-                return ""
-              })
-              .join("")
-          }
-          return ""
-        })()
-        try {
-          const parsed = JSON.parse(content || "{}")
-          toolResults.set(message.tool_call_id, parsed)
-        } catch {
-          // ignore malformed tool messages
-        }
-      }
-    }
-
-    responseStates.clear()
-    itemToResponse.clear()
-    messageResponseMap.clear()
-    componentLoading = new Set<string>()
-
-    chat.messages.forEach((message, index) => {
-      if (message.role !== "assistant") {
-        return
-      }
-      const content =
-        typeof message.content === "string" ? message.content : ""
-      if (!content) {
-        return
-      }
-
-      const segments: AssistantSegment[] = []
-      toolResultComponentPlaceholderRegex.lastIndex = 0
-      let lastIndex = 0
-      let match: RegExpExecArray | null
-
-      while ((match = toolResultComponentPlaceholderRegex.exec(content))) {
-        const matchIndex = match.index ?? 0
-        const textBefore = content.slice(lastIndex, matchIndex).trim()
-        if (textBefore.length) {
-          segments.push({
-            id: `history-${index}-text-${segments.length}`,
-            type: "text",
-            content: textBefore,
-          })
-        }
-        const toolId = match[1]?.trim()
-        const result = toolId ? toolResults.get(toolId) : undefined
-        if (
-          result &&
-          result.component &&
-          !result.removeComponentMessage &&
-          typeof result.component === "object"
-        ) {
-          const componentId =
-            (result.component.componentId as string | undefined) ||
-            toolId ||
-            `history-${index}-component-${segments.length}`
-          segments.push({
-            id: componentId,
-            type: "component",
-            component: result.component as ComponentPayload,
-          })
-        } else if (
-          result &&
-          result.removeComponentMessage &&
-          typeof result.message === "string" &&
-          result.message.length
-        ) {
-          segments.push({
-            id: `history-${index}-text-${segments.length}`,
-            type: "text",
-            content: result.message,
-          })
-        }
-
-        lastIndex = matchIndex + match[0].length
-      }
-
-      const remaining = content.slice(lastIndex).trim()
-      if (remaining.length) {
-        segments.push({
-          id: `history-${index}-text-${segments.length}`,
-          type: "text",
-          content: remaining,
-        })
-      }
-
-      if (!segments.length) {
-        return
-      }
-
-      const responseId = `history-${index}`
-      responseStates.set(responseId, {
-        responseId,
-        messageIndex: index,
-        segments,
-      })
-      messageResponseMap.set(index, responseId)
-      segments.forEach((segment, segmentIndex) => {
-        itemToResponse.set(segment.id, {
-          responseId,
-          segmentIndex,
-        })
-      })
-    })
-
-    responseStatesVersion += 1
-  }
-
   $: if (chat.messages.length) {
     scrollToBottom()
   }
 
   $: if (responseStatesVersion) {
     scrollToBottom()
-  }
-
-  $: if (
-    !activeResponseId &&
-    chat?.messages?.length &&
-    chat.messages.length > 0
-  ) {
-    const key = `${chat._rev ?? "no-rev"}:${chat.messages.length}`
-    if (key !== lastHydratedKey) {
-      rehydrateFromChatHistory()
-      lastHydratedKey = key
-    }
   }
 
   async function scrollToBottom() {
@@ -315,29 +153,23 @@ import type {
       const state = responseStates.get(responseId)
       if (!state) {
         return
-    }
-    const existing = updatedChat.messages[state.messageIndex] as
-      | AssistantMessage
-      | undefined
-    if (!existing) {
-      return
-    }
-    const parts: string[] = []
-    for (const segment of state.segments) {
-      if (segment.type === "component") {
-        if (!segment.hidden) {
-          parts.push(`{{toolResult:component:${segment.id}}}`)
-        }
-      } else if (segment.content.trim().length) {
-        parts.push(segment.content.trim())
       }
-    }
-    const textContent = parts.join("\n\n").trim()
-    const updatedMessage: AssistantMessage = {
-      ...existing,
-      content: textContent,
-    }
-    const messages = [...updatedChat.messages]
+      const existing = updatedChat.messages[state.messageIndex] as
+        | AssistantMessage
+        | undefined
+      if (!existing) {
+        return
+      }
+      const textContent = state.segments
+        .filter(segment => segment.type === "text")
+        .map(segment => segment.content.trim())
+        .filter(Boolean)
+        .join("\n\n")
+      const updatedMessage: AssistantMessage = {
+        ...existing,
+        content: textContent,
+      }
+      const messages = [...updatedChat.messages]
       messages[state.messageIndex] = updatedMessage
       updatedChat = { ...updatedChat, messages }
       chat = { ...chat, messages }
@@ -361,37 +193,39 @@ import type {
       return state
     }
 
-  const replaceSegment = (
-    responseId: string,
-    segmentIndex: number,
-    segment: AssistantSegment
-  ) => {
+    const replaceSegment = (
+      responseId: string,
+      segmentIndex: number,
+      segment: AssistantSegment
+    ) => {
       const state = responseStates.get(responseId)
-    if (!state) {
-      return
+      if (!state) {
+        return
+      }
+      const segments = [...state.segments]
+      segments[segmentIndex] = segment
+      responseStates.set(responseId, {
+        ...state,
+        segments,
+      })
+      responseStatesVersion += 1
+      refreshAssistantMessageContent(responseId)
     }
-    const segments = [...state.segments]
-    segments[segmentIndex] = segment
-    responseStates.set(responseId, {
-      ...state,
-      segments,
-    })
-    reindexResponseSegments(responseId)
-    responseStatesVersion += 1
-    refreshAssistantMessageContent(responseId)
-  }
 
-  const appendSegment = (responseId: string, segment: AssistantSegment) => {
-    const state = getOrCreateResponseState(responseId)
-    const segments = [...state.segments, segment]
-    responseStates.set(responseId, {
-      ...state,
-      segments,
-    })
-    reindexResponseSegments(responseId)
-    responseStatesVersion += 1
-    refreshAssistantMessageContent(responseId)
-  }
+    const appendSegment = (responseId: string, segment: AssistantSegment) => {
+      const state = getOrCreateResponseState(responseId)
+      const segments = [...state.segments, segment]
+      responseStates.set(responseId, {
+        ...state,
+        segments,
+      })
+      itemToResponse.set(segment.id, {
+        responseId,
+        segmentIndex: segments.length - 1,
+      })
+      responseStatesVersion += 1
+      refreshAssistantMessageContent(responseId)
+    }
 
     const updateTextSegment = (
       itemId: string,
@@ -476,24 +310,7 @@ import type {
               if (!current) {
                 break
               }
-              if (
-                event.patch.state === "hidden" &&
-                !event.patch.replaceWith
-              ) {
-                const segments = [...state.segments]
-                segments.splice(mapping.segmentIndex, 1)
-                responseStates.set(mapping.responseId, {
-                  ...state,
-                  segments,
-                })
-                itemToResponse.delete(event.itemId)
-                reindexResponseSegments(mapping.responseId)
-                responseStatesVersion += 1
-                refreshAssistantMessageContent(mapping.responseId)
-                if (current.type === "component") {
-                  clearComponentLoading(current.id)
-                }
-              } else if (event.patch.replaceWith) {
+              if (event.patch.replaceWith) {
                 const replacement: AssistantSegment =
                   event.patch.replaceWith.type === "text"
                     ? ({
@@ -513,6 +330,10 @@ import type {
                   replacement
                 )
                 itemToResponse.delete(event.itemId)
+                itemToResponse.set(replacement.id, {
+                  responseId: mapping.responseId,
+                  segmentIndex: mapping.segmentIndex,
+                })
                 clearComponentLoading(event.itemId)
               } else if (current.type === "component") {
                 const updatedSegment: AssistantComponentSegment = {
@@ -671,7 +492,6 @@ import type {
     componentLoading = new Set<string>()
     responseStatesVersion = 0
     activeResponseId = null
-     lastHydratedKey = null
     chat = { title: "", messages: [], agentId: chat.agentId }
 
     // Ensure we always autoscroll to reveal new messages

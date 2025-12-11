@@ -1,4 +1,3 @@
-import fetch from "node-fetch"
 import * as sso from "./sso"
 import { ssoCallbackUrl } from "../utils"
 import { validEmail } from "../../../utils"

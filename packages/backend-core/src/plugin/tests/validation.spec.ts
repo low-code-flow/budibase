@@ -1,5 +1,4 @@
 import { validate } from "../utils"
-import fetch from "node-fetch"
 import { PluginType } from "@budibase/types"
 import nock from "nock"
 

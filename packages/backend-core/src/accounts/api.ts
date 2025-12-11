@@ -1,4 +1,3 @@
-import fetch from "node-fetch"
 import * as logging from "../logging"
 
 export default class API {

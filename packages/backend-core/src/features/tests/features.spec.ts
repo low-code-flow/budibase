@@ -2,7 +2,6 @@ import { IdentityContext, IdentityType } from "@budibase/types"
 import { FlagSet, init, shutdown } from "../"
 import * as context from "../../context"
 import environment, { withEnv } from "../../environment"
-import nodeFetch from "node-fetch"
 import nock from "nock"
 
 const schema = {
@@ -174,13 +173,13 @@ describe("feature flags", () => {
       }
 
       await withEnv(env, async () => {
-        // We need to pass in node-fetch here otherwise nock won't get used
+        // We need to pass in fetch here otherwise nock won't get used
         // because posthog-node uses axios under the hood.
         init({
           // Required for local evaluation rule polling to start
           personalApiKey: "test",
           fetch: (url, opts) => {
-            return nodeFetch(url, opts)
+            return fetch(url, opts)
           },
         })
 
@@ -227,13 +226,13 @@ describe("feature flags", () => {
       lastName: "User",
     }
 
-    // We need to pass in node-fetch here otherwise nock won't get used
+    // We need to pass in fetch here otherwise nock won't get used
     // because posthog-node uses axios under the hood.
     init({
       // Required for local evaluation rule polling to start
       personalApiKey: "test",
       fetch: (url, opts) => {
-        return nodeFetch(url, opts)
+        return fetch(url, opts)
       },
     })
 
@@ -275,7 +274,7 @@ describe("feature flags", () => {
         // Required for local evaluation rule polling to start
         personalApiKey: "test",
         fetch: (url, opts) => {
-          return nodeFetch(url, opts)
+          return fetch(url, opts)
         },
       })
 

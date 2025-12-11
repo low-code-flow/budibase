@@ -1,8 +1,6 @@
 import chalk from "chalk"
 import fs from "fs"
 import path, { join } from "path"
-import fetch from "node-fetch"
-
 const progress = require("cli-progress")
 
 export function downloadFile(url: string, filePath: string) {

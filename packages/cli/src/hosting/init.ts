@@ -6,8 +6,6 @@ import { parseEnv } from "../utils"
 import { checkDockerConfigured, downloadDockerCompose } from "./utils"
 import { watchPlugins } from "./watch"
 import { generateUser } from "./genUser"
-import fetch from "node-fetch"
-
 const DO_USER_DATA_URL = "http://169.254.169.254/metadata/v1/user-data"
 
 async function getInitConfig(type: string, isQuick: boolean, port: number) {

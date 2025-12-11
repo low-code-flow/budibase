@@ -1,7 +1,5 @@
 import PouchDB from "pouchdb"
 import { checkSlashesInUrl } from "../utils"
-import fetch from "node-fetch"
-
 /**
  * Fully qualified URL including username and password, or nothing for local
  */

@@ -268,7 +268,7 @@ describe("feature flags", () => {
     await withEnv(env, async () => {
       mockPosthogFlags({ TEST_BOOLEAN: true })
 
-      // We need to pass in node-fetch here otherwise nock won't get used
+      // We need to pass in fetch here otherwise nock won't get used
       // because posthog-node uses axios under the hood.
       init({
         // Required for local evaluation rule polling to start
